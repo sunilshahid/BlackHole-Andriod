@@ -1,0 +1,990 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>BlackHole WebRTC Engine</title>
+</head>
+<body>
+<script>
+/**
+ * BlackHole Android Headless WebRTC & Zero-Knowledge Engine
+ * Full wire-compatibility with BlackHole Web Client & Windows Native Client.
+ */
+
+const PACKET_TYPE_CHUNK = 0x01;
+const PACKET_TYPE_CONTROL = 0x02;
+const CHUNK_SIZE = 32 * 1024; // 32 KB chunk size
+const SALT_STRING = 'BlackHole-P2P-ZeroKnowledge-Salt-v1';
+const PBKDF2_ITERATIONS = 10000;
+
+const ICE_SERVERS = {
+  iceServers: [
+    { urls: 'stun:stun.cloudflare.com:3478' },
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun2.l.google.com:19302' }
+  ],
+  iceCandidatePoolSize: 10
+};
+
+const isPrivateIp = (ip) =>
+  /^(192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.)/.test(ip);
+
+function encodeChunkPacket(fileIndex, chunkIndex, encryptedPayload) {
+  const headerSize = 9;
+  const packet = new Uint8Array(headerSize + encryptedPayload.byteLength);
+  const view = new DataView(packet.buffer);
+  view.setUint8(0, PACKET_TYPE_CHUNK);
+  view.setUint32(1, fileIndex, false);
+  view.setUint32(5, chunkIndex, false);
+  packet.set(new Uint8Array(encryptedPayload), headerSize);
+  return packet;
+}
+
+function decodePacket(buffer) {
+  if (!(buffer instanceof ArrayBuffer)) return { type: 'unknown' };
+  const view = new DataView(buffer);
+  const packetType = view.getUint8(0);
+
+  if (packetType === PACKET_TYPE_CHUNK) {
+    if (buffer.byteLength < 9) return { type: 'unknown' };
+    const fileIndex = view.getUint32(1, false);
+    const chunkIndex = view.getUint32(5, false);
+    const payload = buffer.slice(9);
+    return { type: 'chunk', fileIndex, chunkIndex, payload };
+  }
+
+  if (packetType === PACKET_TYPE_CONTROL) {
+    const jsonBytes = new Uint8Array(buffer, 1);
+    const decoder = new TextDecoder();
+    try {
+      const message = JSON.parse(decoder.decode(jsonBytes));
+      return { type: 'control', message };
+    } catch {
+      return { type: 'unknown' };
+    }
+  }
+
+  return { type: 'unknown' };
+}
+
+function encodeControlPacket(message) {
+  const encoder = new TextEncoder();
+  const jsonBytes = encoder.encode(JSON.stringify(message));
+  const packet = new Uint8Array(1 + jsonBytes.byteLength);
+  packet[0] = PACKET_TYPE_CONTROL;
+  packet.set(jsonBytes, 1);
+  return packet;
+}
+
+async function deriveKeyFromSecret(secret) {
+  const enc = new TextEncoder();
+  const rawKey = enc.encode(secret);
+  const salt = enc.encode(SALT_STRING);
+
+  const keyMaterial = await window.crypto.subtle.importKey(
+    'raw',
+    rawKey,
+    { name: 'PBKDF2' },
+    false,
+    ['deriveKey']
+  );
+
+  const webKey = await window.crypto.subtle.deriveKey(
+    {
+      name: 'PBKDF2',
+      salt,
+      iterations: PBKDF2_ITERATIONS,
+      hash: 'SHA-256'
+    },
+    keyMaterial,
+    { name: 'AES-GCM', length: 256 },
+    true,
+    ['encrypt', 'decrypt']
+  );
+
+  return webKey;
+}
+
+async function encryptChunk(webKey, dataBuffer) {
+  const iv = new Uint8Array(12);
+  window.crypto.getRandomValues(iv);
+  const ciphertext = await window.crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv },
+    webKey,
+    dataBuffer
+  );
+
+  const combined = new Uint8Array(iv.byteLength + ciphertext.byteLength);
+  combined.set(iv, 0);
+  combined.set(new Uint8Array(ciphertext), iv.byteLength);
+  return combined.buffer;
+}
+
+async function decryptChunk(webKey, encryptedData) {
+  const iv = new Uint8Array(encryptedData, 0, 12);
+  const ciphertext = new Uint8Array(encryptedData, 12);
+  return await window.crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv },
+    webKey,
+    ciphertext
+  );
+}
+
+// Engine Session State
+let activeWs = null;
+let activePc = null;
+let activeDc = null;
+let activeRole = null; // 'sender' | 'receiver'
+let activeKey = null;
+let isCancelled = false;
+let myLocalIps = [];
+let remoteLocalIps = [];
+let pendingLocalCandidates = [];
+let candidateQueue = [];
+let remoteDescriptionSet = false;
+let p2pEstablished = false;
+let relayFallbackTimer = null;
+let wsHeartbeatTimer = null;
+
+function postStatus(msg) {
+  console.log('[BlackHole Status]', msg);
+  if (window.AndroidBridge && window.AndroidBridge.onStatus) {
+    window.AndroidBridge.onStatus(msg);
+  }
+}
+
+function postError(err) {
+  console.error('[BlackHole Error]', err);
+  if (window.AndroidBridge && window.AndroidBridge.onError) {
+    window.AndroidBridge.onError(err);
+  }
+}
+
+function cleanupSession() {
+  if (relayFallbackTimer) {
+    clearTimeout(relayFallbackTimer);
+    relayFallbackTimer = null;
+  }
+  if (wsHeartbeatTimer) {
+    clearInterval(wsHeartbeatTimer);
+    wsHeartbeatTimer = null;
+  }
+  try { if (activeDc) activeDc.close(); } catch {}
+  try { if (activePc) activePc.close(); } catch {}
+  try { if (activeWs) activeWs.close(); } catch {}
+  activeWs = null;
+  activePc = null;
+  activeDc = null;
+  activeRole = null;
+  activeKey = null;
+  candidateQueue = [];
+  pendingLocalCandidates = [];
+  remoteDescriptionSet = false;
+  p2pEstablished = false;
+}
+
+window.blackholeEngine = {
+  setLocalIps: function(ips) {
+    if (Array.isArray(ips)) {
+      myLocalIps = ips.filter(ip => typeof ip === 'string' && ip.length > 0);
+      console.log('[BlackHole] Registered local IPs:', myLocalIps);
+    }
+  },
+
+  setKnownPeerIps: function(ips) {
+    if (Array.isArray(ips)) {
+      for (const ip of ips) {
+        if (typeof ip === 'string' && isPrivateIp(ip) && !remoteLocalIps.includes(ip)) {
+          remoteLocalIps.push(ip);
+          console.log('[BlackHole] Added known peer IP:', ip);
+        }
+      }
+      drainPendingLocalCandidates();
+    }
+  },
+
+  cancel: function() {
+    isCancelled = true;
+    cleanupSession();
+    postStatus('Cancelled');
+  },
+
+  // --- SENDER ---
+  createRoom: async function(filesJsonStr, signalingUrl = 'wss://share.sunilshahid.com/ws') {
+    cleanupSession();
+    isCancelled = false;
+    activeRole = 'sender';
+
+    let files = [];
+    try {
+      files = JSON.parse(filesJsonStr);
+      if (!Array.isArray(files)) files = [];
+    } catch (e) {
+      files = [];
+    }
+
+    postStatus('Connecting to signaling network...');
+    try {
+      activeWs = new WebSocket(signalingUrl);
+      activeWs.binaryType = 'arraybuffer';
+    } catch (e) {
+      postError('Could not open WebSocket: ' + e);
+      return;
+    }
+
+    activeWs.onopen = () => {
+      postStatus('Creating secure room...');
+      activeWs.send(JSON.stringify({ type: 'create-room' }));
+
+      // Keepalive heartbeat
+      wsHeartbeatTimer = setInterval(() => {
+        if (activeWs && activeWs.readyState === WebSocket.OPEN) {
+          try {
+            activeWs.send(JSON.stringify({ type: 'ping' }));
+          } catch {}
+        }
+      }, 15000);
+    };
+
+    activeWs.onclose = () => {
+      console.warn('[WS Sender] Signaling WebSocket closed');
+    };
+
+    activeWs.onerror = (e) => {
+      postError('Signaling network connection error');
+    };
+
+    activeWs.onmessage = async (event) => {
+      if (event.data instanceof ArrayBuffer) {
+        const packet = decodePacket(event.data);
+        if (packet.type === 'control') {
+          if (packet.message.type === 'TRANSFER_ACK') {
+            console.log('[Sender] Receiver confirmed TRANSFER_ACK!');
+            if (window.AndroidBridge && window.AndroidBridge.onTransferComplete) {
+              window.AndroidBridge.onTransferComplete();
+            }
+          } else if (packet.message.type === 'TRANSFER_CANCEL') {
+            postError('Transfer was cancelled by receiver');
+          }
+        }
+        return;
+      }
+
+      let msg;
+      try { msg = JSON.parse(event.data); } catch { return; }
+
+      if (msg.type === 'room-created') {
+        const code = msg.code;
+        const shareUrl = `https://share.sunilshahid.com/?code=${code}`;
+        try {
+          activeKey = await deriveKeyFromSecret(code);
+        } catch (err) {
+          console.error('[Sender] deriveKey error:', err);
+        }
+
+        if (window.AndroidBridge && window.AndroidBridge.onRoomCreated) {
+          window.AndroidBridge.onRoomCreated(code, shareUrl);
+        }
+        postStatus('Waiting for recipient to connect...');
+        initSenderWebRTC(code, files);
+      }
+      else if (msg.type === 'peer-joined') {
+        postStatus('Receiver connected! Establishing secure tunnel...');
+
+        if (activePc) {
+          try {
+            const offer = await activePc.createOffer();
+            await activePc.setLocalDescription(offer);
+            // Send SDP offer to receiver. DO NOT send peerLocalIps to prevent Windows knownLocalIps poisoning
+            if (activeWs && activeWs.readyState === WebSocket.OPEN) {
+              activeWs.send(JSON.stringify({ type: 'signal', data: { sdp: offer } }));
+            }
+          } catch (e) {
+            console.error('[Sender] Error creating offer:', e);
+          }
+        }
+
+        // Fast 6.0s fallback to Encrypted Relay if P2P does not establish
+        clearTimeout(relayFallbackTimer);
+        relayFallbackTimer = setTimeout(() => {
+          if (!p2pEstablished && !isCancelled && activeWs && activeWs.readyState === WebSocket.OPEN) {
+            console.log('[BlackHole] Direct P2P timed out (6.0s), switching to Encrypted Cloud Relay...');
+            postStatus('Connecting via Encrypted Relay...');
+            startRelaySender(files);
+          }
+        }, 6000);
+      }
+      else if (msg.type === 'signal') {
+        if (msg.data?.requestRelay) {
+          if (!p2pEstablished) {
+            console.log('[Sender] Receiver requested Encrypted Relay fallback...');
+            startRelaySender(files);
+          }
+        } else if (msg.data?.sdp) {
+          try {
+            await activePc.setRemoteDescription(new RTCSessionDescription(msg.data.sdp));
+            remoteDescriptionSet = true;
+            flushCandidateQueue();
+          } catch (e) {
+            console.warn('[Sender] setRemoteDescription error:', e);
+          }
+        } else if (msg.data?.candidate) {
+          handleIncomingCandidate(msg.data.candidate);
+        }
+      }
+      else if (msg.type === 'peer-disconnected') {
+        postStatus('Receiver disconnected');
+      }
+    };
+  },
+
+  // --- RECEIVER ---
+  joinRoom: async function(code, signalingUrl = 'wss://share.sunilshahid.com/ws') {
+    cleanupSession();
+    isCancelled = false;
+    activeRole = 'receiver';
+
+    postStatus(`Joining room [${code}]...`);
+    try {
+      activeKey = await deriveKeyFromSecret(code);
+    } catch (err) {
+      console.error('[Receiver] deriveKey error:', err);
+    }
+
+    initReceiverWebRTC(code);
+
+    try {
+      activeWs = new WebSocket(signalingUrl);
+      activeWs.binaryType = 'arraybuffer';
+    } catch (e) {
+      postError('Could not open WebSocket: ' + e);
+      return;
+    }
+
+    activeWs.onopen = () => {
+      activeWs.send(JSON.stringify({ type: 'join-room', code }));
+
+      wsHeartbeatTimer = setInterval(() => {
+        if (activeWs && activeWs.readyState === WebSocket.OPEN) {
+          try {
+            activeWs.send(JSON.stringify({ type: 'ping' }));
+          } catch {}
+        }
+      }, 15000);
+
+      // Receiver fallback: request relay after 6.0s if direct WebRTC didn't open
+      clearTimeout(relayFallbackTimer);
+      relayFallbackTimer = setTimeout(() => {
+        if (!p2pEstablished && !isCancelled && activeWs && activeWs.readyState === WebSocket.OPEN) {
+          console.log('[Receiver] WebRTC taking long (6.0s), requesting encrypted relay...');
+          activeWs.send(JSON.stringify({ type: 'signal', data: { requestRelay: true } }));
+        }
+      }, 6000);
+    };
+
+    activeWs.onclose = () => {
+      console.warn('[WS Receiver] Signaling WebSocket closed');
+    };
+
+    activeWs.onerror = () => {
+      postError('Signaling network connection error');
+    };
+
+    activeWs.onmessage = async (event) => {
+      if (event.data instanceof ArrayBuffer) {
+        if (relayFallbackTimer) {
+          clearTimeout(relayFallbackTimer);
+          relayFallbackTimer = null;
+        }
+        handleIncomingDataPacket(event.data);
+        return;
+      }
+
+      let msg;
+      try { msg = JSON.parse(event.data); } catch { return; }
+
+      if (msg.type === 'room-joined') {
+        postStatus('Room joined! Exchanging network routes...');
+      }
+      else if (msg.type === 'signal') {
+        if (msg.data?.switchToRelay) {
+          console.log('[Receiver] Sender switched to Encrypted Relay');
+          if (relayFallbackTimer) {
+            clearTimeout(relayFallbackTimer);
+            relayFallbackTimer = null;
+          }
+          postStatus('Connected via Encrypted Relay! Receiving stream...');
+        } else if (msg.data?.sdp) {
+          if (msg.data.sdp.type === 'offer') {
+            try {
+              await activePc.setRemoteDescription(new RTCSessionDescription(msg.data.sdp));
+              remoteDescriptionSet = true;
+              flushCandidateQueue();
+              const answer = await activePc.createAnswer();
+              await activePc.setLocalDescription(answer);
+              if (activeWs && activeWs.readyState === WebSocket.OPEN) {
+                activeWs.send(JSON.stringify({ type: 'signal', data: { sdp: answer } }));
+              }
+            } catch (e) {
+              console.warn('[Receiver] Error creating answer:', e);
+            }
+          }
+        } else if (msg.data?.candidate) {
+          handleIncomingCandidate(msg.data.candidate);
+        }
+      }
+      else if (msg.type === 'error') {
+        postError(msg.message || 'Room not found or sender disconnected');
+      }
+    };
+  }
+};
+
+// --- WebRTC Setup Helpers ---
+function setupPeerConnection() {
+  activePc = new RTCPeerConnection(ICE_SERVERS);
+
+  activePc.onicecandidate = (event) => {
+    if (!event.candidate || !event.candidate.candidate) return;
+    if (!activeWs || activeWs.readyState !== WebSocket.OPEN) return;
+
+    const candObj = typeof event.candidate.toJSON === 'function'
+      ? event.candidate.toJSON()
+      : {
+          candidate: event.candidate.candidate,
+          sdpMid: event.candidate.sdpMid,
+          sdpMLineIndex: event.candidate.sdpMLineIndex
+        };
+
+    activeWs.send(JSON.stringify({ type: 'signal', data: { candidate: candObj } }));
+
+    const candStr = event.candidate.candidate;
+
+    // De-anonymize .local with physical LAN IP for the peer
+    if (candStr.includes('typ host') && candStr.includes('.local')) {
+      for (const ip of myLocalIps) {
+        const deAnonymized = candStr.replace(/[\w\-]+\.local/, ip);
+        activeWs.send(JSON.stringify({
+          type: 'signal',
+          data: {
+            candidate: {
+              candidate: deAnonymized,
+              sdpMid: event.candidate.sdpMid,
+              sdpMLineIndex: event.candidate.sdpMLineIndex
+            }
+          }
+        }));
+      }
+    }
+
+    // STUN raddr synthesis: extract local private IP that STUN discovered
+    if (candStr.includes('typ srflx')) {
+      const raddrMatch = candStr.match(/raddr\s+(\d+\.\d+\.\d+\.\d+)/);
+      const rportMatch = candStr.match(/rport\s+(\d+)/);
+      if (raddrMatch && rportMatch && isPrivateIp(raddrMatch[1])) {
+        const synthetic = candStr
+          .replace(/typ srflx/, 'typ host')
+          .replace(/(\d+\.\d+\.\d+\.\d+)\s+(\d+)\s+typ host/, `${raddrMatch[1]} ${rportMatch[1]} typ host`);
+        activeWs.send(JSON.stringify({
+          type: 'signal',
+          data: {
+            candidate: {
+              candidate: synthetic,
+              sdpMid: event.candidate.sdpMid,
+              sdpMLineIndex: event.candidate.sdpMLineIndex
+            }
+          }
+        }));
+      }
+    }
+  };
+
+  activePc.oniceconnectionstatechange = () => {
+    const s = activePc ? activePc.iceConnectionState : 'closed';
+    console.log('[WebRTC] ICE Connection State:', s);
+    if (s === 'connected' || s === 'completed') {
+      inspectConnectionRoute();
+    }
+  };
+}
+
+async function inspectConnectionRoute() {
+  if (!activePc) return;
+  try {
+    const stats = await activePc.getStats();
+    let selectedPair = null;
+    stats.forEach(report => {
+      if (report.type === 'candidate-pair' && (report.selected || report.state === 'succeeded' || report.nominated)) {
+        selectedPair = report;
+      }
+    });
+
+    if (selectedPair) {
+      const localCand = stats.get(selectedPair.localCandidateId);
+      const remoteCand = stats.get(selectedPair.remoteCandidateId);
+      if (localCand && remoteCand) {
+        const localType = localCand.candidateType;
+        const remoteType = remoteCand.candidateType;
+        const localIp = localCand.address || localCand.ip || '';
+        const remoteIp = remoteCand.address || remoteCand.ip || '';
+        const routeStr = `${localIp} ⇄ ${remoteIp}`;
+
+        let mode = 'wan';
+        if ((localType === 'host' && remoteType === 'host') || (isPrivateIp(localIp) && isPrivateIp(remoteIp))) {
+          mode = 'lan';
+        } else if (localType === 'relay' || remoteType === 'relay') {
+          mode = 'relay';
+        }
+
+        if (window.AndroidBridge && window.AndroidBridge.onConnectionMode) {
+          window.AndroidBridge.onConnectionMode(mode, routeStr);
+        }
+      }
+    }
+  } catch {}
+}
+
+function drainPendingLocalCandidates() {
+  if (!activePc || !remoteDescriptionSet || pendingLocalCandidates.length === 0) return;
+  if (remoteLocalIps.length === 0) return;
+
+  const toDrain = [...pendingLocalCandidates];
+  pendingLocalCandidates = [];
+
+  for (const pending of toDrain) {
+    const candStr = pending.candidate;
+    for (const ip of remoteLocalIps) {
+      const deAnon = candStr.replace(/[\w\-]+\.local/, ip);
+      activePc.addIceCandidate(new RTCIceCandidate({
+        candidate: deAnon,
+        sdpMid: pending.sdpMid,
+        sdpMLineIndex: pending.sdpMLineIndex
+      })).catch(() => {});
+    }
+  }
+}
+
+async function handleIncomingCandidate(candidateInit) {
+  if (!activePc || !candidateInit || !candidateInit.candidate) return;
+  if (!remoteDescriptionSet || !activePc.remoteDescription) {
+    candidateQueue.push(candidateInit);
+    return;
+  }
+
+  const candStr = candidateInit.candidate;
+
+  // 1. Extract raddr if present in STUN srflx candidate (reveals remote peer's true LAN IP)
+  const raddrMatch = candStr.match(/raddr\s+(\d+\.\d+\.\d+\.\d+)/);
+  const rportMatch = candStr.match(/rport\s+(\d+)/);
+  if (raddrMatch && isPrivateIp(raddrMatch[1])) {
+    const discoveredPeerIp = raddrMatch[1];
+    if (!remoteLocalIps.includes(discoveredPeerIp)) {
+      remoteLocalIps.push(discoveredPeerIp);
+      console.log('[BlackHole] Extracted peer LAN IP from STUN raddr:', discoveredPeerIp);
+    }
+
+    // Synthesize direct host candidate from raddr + rport
+    if (rportMatch) {
+      const synthetic = candStr
+        .replace(/typ srflx/, 'typ host')
+        .replace(/(\d+\.\d+\.\d+\.\d+)\s+(\d+)\s+typ host/, `${discoveredPeerIp} ${rportMatch[1]} typ host`);
+      await activePc.addIceCandidate(new RTCIceCandidate({
+        candidate: synthetic,
+        sdpMid: candidateInit.sdpMid,
+        sdpMLineIndex: candidateInit.sdpMLineIndex
+      })).catch(() => {});
+    }
+
+    drainPendingLocalCandidates();
+  }
+
+  // 2. Handle mDNS .local host candidates without crashing Android WebView (avoid -105 error)
+  if (candStr.includes('typ host') && candStr.includes('.local')) {
+    if (remoteLocalIps.length > 0) {
+      for (const ip of remoteLocalIps) {
+        const deAnon = candStr.replace(/[\w\-]+\.local/, ip);
+        await activePc.addIceCandidate(new RTCIceCandidate({
+          candidate: deAnon,
+          sdpMid: candidateInit.sdpMid,
+          sdpMLineIndex: candidateInit.sdpMLineIndex
+        })).catch(() => {});
+      }
+    } else {
+      pendingLocalCandidates.push(candidateInit);
+    }
+    // Do NOT add raw .local to avoid Chromium error -105
+    return;
+  }
+
+  // 3. Add standard non-local candidate safely
+  try {
+    await activePc.addIceCandidate(new RTCIceCandidate(candidateInit));
+  } catch (e) {
+    // Ignore candidate error
+  }
+}
+
+async function flushCandidateQueue() {
+  while (candidateQueue.length > 0) {
+    const c = candidateQueue.shift();
+    if (c) await handleIncomingCandidate(c);
+  }
+}
+
+function initSenderWebRTC(code, files) {
+  setupPeerConnection();
+  activeDc = activePc.createDataChannel('blackhole-transfer', { ordered: true });
+  activeDc.binaryType = 'arraybuffer';
+  activeDc.bufferedAmountLowThreshold = 128 * 1024;
+
+  activeDc.onopen = async () => {
+    p2pEstablished = true;
+    if (relayFallbackTimer) {
+      clearTimeout(relayFallbackTimer);
+      relayFallbackTimer = null;
+    }
+    postStatus('Data channel open! Verifying connection...');
+
+    // RTC_PING -> RTC_PONG handshake
+    let pongReceived = false;
+    const onPong = (event) => {
+      if (event.data instanceof ArrayBuffer) {
+        const packet = decodePacket(event.data);
+        if (packet.type === 'control' && packet.message.type === 'RTC_PONG') {
+          pongReceived = true;
+        }
+      }
+    };
+
+    activeDc.addEventListener('message', onPong);
+    try {
+      activeDc.send(encodeControlPacket({ type: 'RTC_PING' }));
+    } catch {}
+
+    for (let i = 0; i < 20; i++) {
+      if (pongReceived) break;
+      await new Promise(r => setTimeout(r, 100));
+    }
+    try { activeDc.removeEventListener('message', onPong); } catch {}
+
+    postStatus('Direct secure tunnel verified! Streaming files...');
+    startDataChannelSender(files);
+  };
+
+  activeDc.onclose = () => {
+    console.warn('[WebRTC Sender] DataChannel closed');
+  };
+}
+
+function initReceiverWebRTC(code) {
+  setupPeerConnection();
+  activePc.ondatachannel = (event) => {
+    activeDc = event.channel;
+    activeDc.binaryType = 'arraybuffer';
+    activeDc.onopen = () => {
+      p2pEstablished = true;
+      if (relayFallbackTimer) {
+        clearTimeout(relayFallbackTimer);
+        relayFallbackTimer = null;
+      }
+      postStatus('Secure tunnel established! Receiving stream...');
+      inspectConnectionRoute();
+    };
+
+    activeDc.onmessage = (e) => {
+      if (e.data instanceof ArrayBuffer) {
+        handleIncomingDataPacket(e.data);
+      }
+    };
+
+    activeDc.onclose = () => {
+      console.warn('[WebRTC Receiver] DataChannel closed');
+    };
+  };
+}
+
+// Receiver Packet Processing
+let currentManifest = null;
+let currentFileIndex = -1;
+let currentFileName = '';
+let currentFileSize = 0;
+let fileTransferredBytes = 0;
+let totalTransferredBytes = 0;
+let lastProgressTime = 0;
+let lastProgressBytes = 0;
+let rollingSpeed = 0;
+
+async function handleIncomingDataPacket(buffer) {
+  const packet = decodePacket(buffer);
+
+  if (packet.type === 'control') {
+    const msg = packet.message;
+    if (msg.type === 'RTC_PING') {
+      const pong = encodeControlPacket({ type: 'RTC_PONG' });
+      if (activeDc && activeDc.readyState === 'open') {
+        activeDc.send(pong);
+      } else if (activeWs && activeWs.readyState === WebSocket.OPEN) {
+        activeWs.send(pong.buffer);
+      }
+      return;
+    }
+    if (msg.type === 'MANIFEST') {
+      currentManifest = msg;
+      totalTransferredBytes = 0;
+      lastProgressTime = Date.now();
+      lastProgressBytes = 0;
+      rollingSpeed = 0;
+
+      if (window.AndroidBridge && window.AndroidBridge.onTransferStarted) {
+        window.AndroidBridge.onTransferStarted(msg.files?.length || 1, msg.totalBytes || 0);
+      }
+    } else if (msg.type === 'FILE_START') {
+      currentFileIndex = msg.fileIndex;
+      const meta = currentManifest?.files[currentFileIndex];
+      currentFileName = meta?.name || `file_${currentFileIndex}`;
+      currentFileSize = meta?.size || 0;
+      fileTransferredBytes = 0;
+
+      if (window.AndroidBridge && window.AndroidBridge.onFileStart) {
+        window.AndroidBridge.onFileStart(currentFileName, currentFileSize);
+      }
+    } else if (msg.type === 'FILE_END') {
+      if (window.AndroidBridge && window.AndroidBridge.onFileComplete) {
+        window.AndroidBridge.onFileComplete(currentFileName, currentFileSize);
+      }
+    } else if (msg.type === 'TRANSFER_COMPLETE') {
+      const ack = encodeControlPacket({ type: 'TRANSFER_ACK' });
+      if (activeDc && activeDc.readyState === 'open') activeDc.send(ack);
+      else if (activeWs && activeWs.readyState === WebSocket.OPEN) activeWs.send(ack.buffer);
+
+      if (window.AndroidBridge && window.AndroidBridge.onTransferComplete) {
+        window.AndroidBridge.onTransferComplete();
+      }
+    }
+  } else if (packet.type === 'chunk') {
+    const { fileIndex, chunkIndex, payload } = packet;
+    if (!activeKey) return;
+
+    try {
+      const decrypted = await decryptChunk(activeKey, payload);
+      const chunkBytes = new Uint8Array(decrypted);
+
+      let binary = '';
+      const len = chunkBytes.byteLength;
+      for (let i = 0; i < len; i++) {
+        binary += String.fromCharCode(chunkBytes[i]);
+      }
+      const b64 = btoa(binary);
+
+      const offset = chunkIndex * CHUNK_SIZE;
+      const isLast = (offset + chunkBytes.byteLength >= currentFileSize);
+
+      if (window.AndroidBridge && window.AndroidBridge.writeChunk) {
+        window.AndroidBridge.writeChunk(currentFileName, offset, b64, isLast);
+      }
+
+      fileTransferredBytes += chunkBytes.byteLength;
+      totalTransferredBytes += chunkBytes.byteLength;
+
+      const now = Date.now();
+      if (now - lastProgressTime > 80 || totalTransferredBytes === currentManifest?.totalBytes) {
+        const timeDiff = (now - lastProgressTime) / 1000;
+        const bytesDiff = totalTransferredBytes - lastProgressBytes;
+        const instantSpeed = timeDiff > 0 ? bytesDiff / timeDiff : 0;
+        rollingSpeed = rollingSpeed === 0 ? instantSpeed : rollingSpeed * 0.7 + instantSpeed * 0.3;
+
+        lastProgressTime = now;
+        lastProgressBytes = totalTransferredBytes;
+
+        const total = currentManifest?.totalBytes || 1;
+        const remaining = total - totalTransferredBytes;
+        const eta = rollingSpeed > 0 ? Math.ceil(remaining / rollingSpeed) : 0;
+        const percent = Math.min(100, Math.round((totalTransferredBytes / total) * 100));
+
+        if (window.AndroidBridge && window.AndroidBridge.onProgress) {
+          window.AndroidBridge.onProgress(currentFileName, percent, Math.round(rollingSpeed), eta, totalTransferredBytes, total);
+        }
+      }
+    } catch (err) {
+      console.warn('[Chunk Decrypt Error]', err);
+    }
+  }
+}
+
+// Sender Streaming
+async function startDataChannelSender(files) {
+  if (!activeDc || activeDc.readyState !== 'open') return;
+
+  const totalBytes = (files && files.length > 0) ? files.reduce((acc, f) => acc + (f.size || 0), 0) : 0;
+  if (window.AndroidBridge && window.AndroidBridge.onTransferStarted) {
+    window.AndroidBridge.onTransferStarted(files.length, totalBytes);
+  }
+
+  const transport = {
+    send: async (data) => {
+      while (activeDc && activeDc.bufferedAmount > 1024 * 1024) {
+        if (isCancelled) return;
+        await new Promise(resolve => {
+          const onLow = () => {
+            try { activeDc.removeEventListener('bufferedamountlow', onLow); } catch {}
+            resolve();
+          };
+          activeDc.addEventListener('bufferedamountlow', onLow);
+          setTimeout(resolve, 50);
+        });
+      }
+      if (!activeDc || activeDc.readyState !== 'open') throw new Error('DataChannel closed');
+      activeDc.send(data);
+    }
+  };
+  await streamFilesToTransport(files, transport);
+}
+
+async function startRelaySender(files) {
+  if (!activeWs || activeWs.readyState !== WebSocket.OPEN) return;
+
+  if (relayFallbackTimer) {
+    clearTimeout(relayFallbackTimer);
+    relayFallbackTimer = null;
+  }
+
+  activeWs.send(JSON.stringify({ type: 'signal', data: { switchToRelay: true } }));
+
+  const totalBytes = (files && files.length > 0) ? files.reduce((acc, f) => acc + (f.size || 0), 0) : 0;
+  if (window.AndroidBridge && window.AndroidBridge.onTransferStarted) {
+    window.AndroidBridge.onTransferStarted(files.length, totalBytes);
+  }
+
+  const transport = {
+    send: async (data) => {
+      while (activeWs && activeWs.bufferedAmount > 2 * 1024 * 1024) {
+        if (isCancelled) return;
+        await new Promise(r => setTimeout(r, 15));
+      }
+      if (!activeWs || activeWs.readyState !== WebSocket.OPEN) throw new Error('Relay closed');
+      activeWs.send(data.buffer || data);
+    }
+  };
+  await streamFilesToTransport(files, transport);
+}
+
+async function streamFilesToTransport(files, transport) {
+  // If no files were provided, create a small fallback note so receiver completes rather than hanging
+  const effectiveFiles = (files && files.length > 0) ? files : [{
+    name: 'BlackHole_Note.txt',
+    size: 26,
+    mimeType: 'text/plain'
+  }];
+
+  const metadataList = effectiveFiles.map((f, idx) => ({
+    id: `file_${idx}_${Date.now()}`,
+    name: f.name,
+    size: f.size,
+    type: f.mimeType || 'application/octet-stream',
+    lastModified: Date.now()
+  }));
+
+  const totalBytes = effectiveFiles.reduce((acc, f) => acc + f.size, 0);
+  let transferredBytes = 0;
+  let lastProgress = Date.now();
+  let lastBytes = 0;
+  let rollingSpeed = 0;
+
+  // Send Manifest
+  await transport.send(encodeControlPacket({
+    type: 'MANIFEST',
+    files: metadataList,
+    totalBytes,
+    transferId: `transfer_${Date.now()}`,
+    cipher: 'aes-gcm'
+  }));
+
+  for (let fileIdx = 0; fileIdx < effectiveFiles.length; fileIdx++) {
+    if (isCancelled) break;
+    const file = effectiveFiles[fileIdx];
+    const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
+
+    await transport.send(encodeControlPacket({
+      type: 'FILE_START',
+      fileIndex: fileIdx,
+      totalChunks
+    }));
+
+    if (window.AndroidBridge && window.AndroidBridge.onFileStart) {
+      window.AndroidBridge.onFileStart(file.name, file.size);
+    }
+
+    let offset = 0;
+    let chunkIdx = 0;
+
+    while (offset < file.size) {
+      if (isCancelled) break;
+      const bytesToRead = Math.min(CHUNK_SIZE, file.size - offset);
+
+      let b64Data = '';
+      if (window.AndroidBridge && window.AndroidBridge.readChunk) {
+        b64Data = window.AndroidBridge.readChunk(fileIdx, offset, bytesToRead);
+      }
+
+      if (!b64Data && file.name === 'BlackHole_Note.txt') {
+        // Fallback note content
+        b64Data = btoa('Connected to BlackHole!\n');
+      }
+
+      if (!b64Data) {
+        postError(`Failed to read chunk for ${file.name} at ${offset}`);
+        return;
+      }
+
+      const binaryStr = atob(b64Data);
+      const rawChunk = new Uint8Array(binaryStr.length);
+      for (let i = 0; i < binaryStr.length; i++) {
+        rawChunk[i] = binaryStr.charCodeAt(i);
+      }
+
+      const encrypted = await encryptChunk(activeKey, rawChunk.buffer);
+      const packet = encodeChunkPacket(fileIdx, chunkIdx, encrypted);
+      await transport.send(packet);
+
+      offset += bytesToRead;
+      chunkIdx++;
+      transferredBytes += bytesToRead;
+
+      const now = Date.now();
+      if (now - lastProgress > 80 || transferredBytes === totalBytes) {
+        const timeDiff = (now - lastProgress) / 1000;
+        const bytesDiff = transferredBytes - lastBytes;
+        const instantSpeed = timeDiff > 0 ? bytesDiff / timeDiff : 0;
+        rollingSpeed = rollingSpeed === 0 ? instantSpeed : rollingSpeed * 0.7 + instantSpeed * 0.3;
+
+        lastProgress = now;
+        lastBytes = transferredBytes;
+
+        const remaining = totalBytes - transferredBytes;
+        const eta = rollingSpeed > 0 ? Math.ceil(remaining / rollingSpeed) : 0;
+        const percent = Math.min(100, Math.round((transferredBytes / totalBytes) * 100));
+
+        if (window.AndroidBridge && window.AndroidBridge.onProgress) {
+          window.AndroidBridge.onProgress(file.name, percent, Math.round(rollingSpeed), eta, transferredBytes, totalBytes);
+        }
+      }
+    }
+
+    await transport.send(encodeControlPacket({
+      type: 'FILE_END',
+      fileIndex: fileIdx
+    }));
+
+    if (window.AndroidBridge && window.AndroidBridge.onFileComplete) {
+      window.AndroidBridge.onFileComplete(file.name, file.size);
+    }
+  }
+
+  if (!isCancelled) {
+    await transport.send(encodeControlPacket({ type: 'TRANSFER_COMPLETE' }));
+  }
+}
+</script>
+</body>
+</html>

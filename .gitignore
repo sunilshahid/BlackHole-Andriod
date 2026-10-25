@@ -1,0 +1,32 @@
+# Built binaries & release packages (distribute via GitHub Releases)
+*.apk
+*.aab
+*.ap_
+
+# Gradle & Kotlin caches
+.gradle/
+.kotlin/
+build/
+app/build/
+bin/
+gen/
+out/
+
+# Intermediate compiled code
+*.dex
+*.class
+
+# IDE & Editor files
+.idea/
+*.iml
+.vscode/
+local.properties
+.externalNativeBuild/
+.cxx/
+captures/
+
+# OS metadata
+.DS_Store
+Thumbs.db
+desktop.ini
+*.log
